@@ -1,0 +1,10 @@
+{
+  "name": "tokimeki-schedule-calculator",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "《心跳回忆》日程计算器（单文件 / 零依赖 / 不联网）",
+  "scripts": {
+    "build": "node src/build.js"
+  }
+}
