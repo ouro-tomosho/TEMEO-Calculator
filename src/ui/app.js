@@ -17,7 +17,7 @@ import {
 import {
   addDays, isSunday, monthEnd, shiftMonth, mondaysBetween,
 } from '../calendar.js';
-import { buildProblem, validateInput, defaultInput } from '../model.js';
+import { buildProblem, validateInput, defaultInput, frozenFromPlan } from '../model.js';
 import { solve } from '../solver.js';
 import { assembleResult } from '../result.js';
 import { createStore } from '../store.js';
@@ -83,6 +83,17 @@ export function mountApp(root) {
     solution: null,
     result: null,
     error: null,
+    // 增量重规划：
+    //   commitBefore —— 上一次求解已固定的边界（该日期之前的排程不再变动）
+    //   editBefore   —— 自上次求解以来最早被编辑的日期（优先于 commitBefore）
+    //   canFreeze    —— 当前 state.solution 是否与输入匹配（改输入后必须先重算）
+    //   storedFrozen —— 上一次求解实际使用的固定前缀（随 ui 存档持久化，
+    //                   使刷新页面后首帧求解也能延续同一份历史）
+    // 边界为空时表示整段自由重算（改输入 / 恢复默认会清空）。
+    commitBefore: null,
+    editBefore: null,
+    canFreeze: false,
+    storedFrozen: null,
     sel: null,
     dragging: false,
     messages: [],
@@ -95,6 +106,8 @@ export function mountApp(root) {
   state.annotations = store.loaded.annotations || {};
   state.ui = { ...state.ui, ...(store.loaded.ui || {}) };
   delete state.ui.mode; // 视野选择已取消，清掉旧存档里的残留键
+  state.storedFrozen = state.ui.frozen && state.ui.frozen.before ? state.ui.frozen : null;
+  state.commitBefore = state.storedFrozen ? state.storedFrozen.before : null;
   state.input.annotations = state.annotations;
   // 可输入日期仅限 95 年 4 月 ~ 98 年 3 月：越界存档直接夹回范围内
   state.input.currentDate = clampDate(state.input.currentDate);
@@ -139,10 +152,12 @@ export function mountApp(root) {
       state.input.currentDate = clampDate(e.target.value || state.input.currentDate);
       e.target.value = state.input.currentDate;
       state.ui.month = clampWindowStart(state.input.currentDate.slice(0, 7));
+      clearFreeze();
       persist(); renderCalendar(); scheduleSolve();
     });
     $('#in-club').addEventListener('change', (e) => {
       state.input.club = e.target.value;
+      clearFreeze();
       persist(); scheduleSolve();
     });
     $('#input-card').addEventListener('input', (e) => {
@@ -154,12 +169,14 @@ export function mountApp(root) {
       if (!ok) return;
       if (t.dataset.kind === 'attr') state.input.attrs[t.dataset.key] = v;
       else state.input.targets[t.dataset.key] = v;
+      clearFreeze();
       persist(); scheduleSolve();
     });
     $('#btn-solve').addEventListener('click', () => runSolve());
     $('#btn-reset').addEventListener('click', () => {
       state.input = defaultInput();
       state.input.annotations = state.annotations;
+      clearFreeze();
       persist(); renderInputs(); runSolve();
     });
   }
@@ -305,6 +322,7 @@ export function mountApp(root) {
       if (!ws) return;
       const v = e.target.value;
       if (v) state.input.weekForces[ws] = v; else delete state.input.weekForces[ws];
+      markEdit(ws);
       persist(); renderCalendar(); scheduleSolve();
     });
     renderBatch();
@@ -419,6 +437,7 @@ export function mountApp(root) {
     }
     if (act === 'clear' && sundayTouched) toast('周日固定为休日，「清除标记」只清除跳过与强制');
     else if (act === 'rest' && sundayTouched) toast('周日固定为休日，无需设置');
+    markEdit(a);
     persist(); renderCalendar(); scheduleSolve();
   }
 
@@ -479,6 +498,7 @@ export function mountApp(root) {
       if (value.force && !value.skip) clean.force = value.force;
       if (Object.keys(clean).length) state.annotations[date] = clean; else delete state.annotations[date];
     }
+    markEdit(date);
     persist(); renderCalendar(); scheduleSolve();
   }
 
@@ -518,6 +538,45 @@ export function mountApp(root) {
     solveTimer = setTimeout(() => { solveTimer = null; runSolve(); }, 320);
   }
 
+  /**
+   * 记录日历编辑点（增量重规划）：自上次求解以来取**最早**的编辑日期，
+   * 重新求解时只允许从该日期起变动，之前的排程原样固定。
+   * 没有上一份可用的解时无从固定，等价于整段重算。
+   */
+  function markEdit(anchor) {
+    if (!state.canFreeze || !state.problem || !state.solution || !state.solution.plan) return;
+    if (!state.editBefore || anchor < state.editBefore) state.editBefore = anchor;
+  }
+
+  /** 改输入 / 恢复默认：之前的固定承诺不再适用于新问题，整段重算 */
+  function clearFreeze() {
+    state.commitBefore = null;
+    state.editBefore = null;
+    state.canFreeze = false;
+    state.storedFrozen = null;
+    state.ui.frozen = null;
+  }
+
+  /**
+   * 本次求解要固定的边界：优先取「自上次求解以来的最早编辑点」，
+   * 其次沿用上次求解已固化的边界（保证重复求解 / 手动「求解」不会打乱已有排程）。
+   */
+  function freezeBoundary() {
+    return state.editBefore || state.commitBefore || null;
+  }
+
+  /**
+   * 「边界之前」的固定前缀：优先由上一份解现场推导；页面刷新后首帧没有上一份解，
+   * 退回存档里保存的上一次使用的固定前缀（边界一致时二者等价）。
+   */
+  function pendingFrozen() {
+    const before = freezeBoundary();
+    if (!before) return null;
+    const derived = frozenFromPlan(state.problem, state.solution && state.solution.plan, before);
+    if (derived) return derived;
+    return state.storedFrozen && state.storedFrozen.before === before ? state.storedFrozen : null;
+  }
+
   function collectInput() {
     return {
       ...state.input,
@@ -537,9 +596,11 @@ export function mountApp(root) {
     let problem = null;
     let solution = null;
     let result = null;
+    const boundary = freezeBoundary();
+    const frozen = pendingFrozen();
     const t = (typeof performance !== 'undefined' ? performance.now() : Date.now());
     try {
-      problem = buildProblem(input);
+      problem = buildProblem(input, { frozen });
       solution = solve(problem);
       result = assembleResult(problem, solution, displayWindow(problem));
       result.elapsedMs = Math.round((typeof performance !== 'undefined' ? performance.now() : Date.now()) - t);
@@ -551,6 +612,13 @@ export function mountApp(root) {
     state.problem = problem;
     state.solution = solution;
     state.result = result;
+    const usedFrozen = solution.plan ? frozen : null; // 实际生效的固定前缀
+    state.commitBefore = usedFrozen ? boundary : null; // 新解已固化该边界；无解时不保留承诺
+    state.canFreeze = !!solution.plan;                 // 之后的日历编辑可基于这份解固定前缀
+    state.editBefore = null;
+    state.storedFrozen = usedFrozen;
+    state.ui.frozen = usedFrozen;                      // 随 ui 存档持久化，刷新后延续
+    persist();
     renderResults();
     renderCalendar();
     if (!silent) {
@@ -584,6 +652,7 @@ export function mountApp(root) {
     // ---- 指令页：逐周 + 逐休日合并成一张按时间排序的表
     function planPanel(res) {
       const allWeeks = state.problem ? state.problem.weeks : [];
+      const markText = (it) => (it.frozen ? '🔒 已固定' : (it.forced ? '🔒 强制' : ''));
       const rows = [];
       res.executable.weeks.forEach((w, i) => {
         const no = allWeeks.findIndex((x) => x.weekStart === w.weekStart);
@@ -592,7 +661,7 @@ export function mountApp(root) {
           date: w.range,
           type: `第 ${no >= 0 ? no + 1 : i + 1} 周 · 平时块 ${w.blockDays} 天`,
           cmd: w.commandName || '—',
-          mark: w.forced ? '🔒 强制' : '',
+          mark: markText(w),
         });
       });
       res.executable.restSlots.forEach((s) => {
@@ -601,12 +670,16 @@ export function mountApp(root) {
           date: s.date.slice(5),
           type: s.skipped ? '跳过' : (isSunday(s.date) ? '休日 · 周日' : '休日'),
           cmd: s.skipped ? '—' : (s.commandName || '—'),
-          mark: s.forced ? '🔒 强制' : '',
+          mark: s.skipped ? '' : markText(s),
         });
       });
       rows.sort((a, b) => (a.sort < b.sort ? -1 : (a.sort > b.sort ? 1 : 0)));
 
       let h = `<h3 class="ptitle">显示区间 ${res.horizon.displayFrom} ~ ${res.horizon.displayEnd}（逐周指令 + 逐休日指令）</h3>`;
+      if (res.frozenBefore) {
+        h += `<div class="hint" style="margin-bottom:4px">增量重规划：${res.frozenBefore} 之前的排程已固定（🔒 已固定），只重新规划该日期之后的安排。`
+          + '<button id="btn-unfreeze" style="margin-left:6px">解除固定，全局重算</button></div>';
+      }
       // 社团指令约束（硬性要求）的完成情况：只在选中社团时给出这一条状态
       if (res.club && res.club.clubId) {
         const c = res.club;
@@ -680,7 +753,7 @@ export function mountApp(root) {
         + '</div>';
     }
     html += `<div class="metaline">
-      <span class="hint">全局求解 ${r.horizon.from} ~ ${r.horizon.T}（毕业） · 显示 ${r.horizon.displayFrom} ~ ${r.horizon.displayEnd}（两月） · 总差距 ${r.objective === null ? '—' : r.objective} · ${r.meta.elapsedMs} ms</span>
+      <span class="hint">全局求解 ${r.horizon.from} ~ ${r.horizon.T}（毕业） · 显示 ${r.horizon.displayFrom} ~ ${r.horizon.displayEnd}（两月）${r.frozenBefore ? ` · 已固定 ${r.frozenBefore} 之前` : ''} · 总差距 ${r.objective === null ? '—' : r.objective} · ${r.meta.elapsedMs} ms</span>
     </div>`;
 
     const tabBtn = (id, name) => `<button data-tab="${id}"${activeTab === id ? ' class="on"' : ''}>${name}</button>`;
@@ -700,6 +773,15 @@ export function mountApp(root) {
         card.querySelectorAll('[data-panel]').forEach((p) => { p.hidden = p.dataset.panel !== state.ui.tab; });
       });
     });
+
+    const unfreezeBtn = card.querySelector('#btn-unfreeze');
+    if (unfreezeBtn) {
+      unfreezeBtn.addEventListener('click', () => {
+        clearFreeze(); // 放弃增量固定，回到整段全局重算
+        persist();
+        runSolve();
+      });
+    }
   }
 
   // ================================================================ 工具

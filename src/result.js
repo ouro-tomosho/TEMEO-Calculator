@@ -34,6 +34,7 @@ export function assembleResult(problem, solution, opts = {}) {
       objective: null,
       objectiveS: null,
       verdict: `无法求解：${solution.infeasible.reason}`,
+      frozenBefore: problem.frozenBefore || null,
       saturation: { clamped: false, affectedTargets: [], wasted: {} },
       executable: { weeks: [], restSlots: [] },
       trajectory: [],
@@ -54,6 +55,9 @@ export function assembleResult(problem, solution, opts = {}) {
   // ---- executable：对外只给显示窗口内的切片（全局解不外泄）
   const inDisplay = (d) => d >= displayFrom && d <= displayEnd;
   const forcedWeekSet = new Set(problem.forcedWeeks.map((f) => f.weekStart));
+  const frozenWeekSet = new Set(problem.forcedWeeks.filter((f) => f.frozen).map((f) => f.weekStart));
+  const forcedRestSet = new Set(problem.forcedRest.map((f) => f.date));
+  const frozenRestSet = new Set(problem.forcedRest.filter((f) => f.frozen).map((f) => f.date));
   const weeks = [];
   for (const wk of problem.weeks) {
     if (wk.m === 0) continue;
@@ -69,6 +73,7 @@ export function assembleResult(problem, solution, opts = {}) {
       command: cmd ? cmd.id : null,
       commandName: cmd ? cmd.name : null,
       forced: forcedWeekSet.has(wk.weekStart),
+      frozen: frozenWeekSet.has(wk.weekStart),
     });
   }
 
@@ -81,11 +86,14 @@ export function assembleResult(problem, solution, opts = {}) {
         date: day.date,
         command: cmd ? cmd.id : null,
         commandName: cmd ? cmd.name : null,
-        forced: !!day.forced,
+        forced: forcedRestSet.has(day.date),
+        frozen: frozenRestSet.has(day.date),
         skipped: false,
       });
     } else if (day.kind === 'skip') {
-      restSlots.push({ date: day.date, command: null, commandName: null, forced: false, skipped: true });
+      restSlots.push({
+        date: day.date, command: null, commandName: null, forced: false, frozen: false, skipped: true,
+      });
     }
   }
 
@@ -163,6 +171,7 @@ export function assembleResult(problem, solution, opts = {}) {
     objective,
     objectiveS: objS,
     verdict,
+    frozenBefore: problem.frozenBefore || null,
     saturation: solution.exact.saturation,
     certificate: solution.exact.certificate,
     executable: { weeks, restSlots },

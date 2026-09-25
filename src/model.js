@@ -78,11 +78,16 @@ export function displayWindowEnd(t0, T = horizonEnd(t0)) {
 /**
  * 构造问题实例（领域层的唯一入口）。
  * @param {Object} rawInput §5.2 的输入模型
- * @param {{now?:string, T?:string, ignoreClub?:boolean}} [opts]
+ * @param {{now?:string, T?:string, ignoreClub?:boolean, frozen?:Object}} [opts]
  *        opts.T —— 显式指定求解视野终点，供测试 / 交叉校验构造缩小实例；
  *        正常调用（UI）一律留空，恒为毕业日。
  *        opts.ignoreClub —— 缩小的交叉校验实例用：忽略社团指令约束
  *        （该约束跨越整个视野，被截断的视野下必然不可满足）。
+ *        opts.frozen —— 增量重规划：把 `before` 之前的决策固定为上一份排程，
+ *        只允许改动 `before` 当天及之后的规划。形状：
+ *          { before?:string, weekForces?:{[weekStart]:commandId}, restForces?:{[date]:commandId} }
+ *        固定的决策点与用户强制走同一条硬约束通道（进入 forcedWeeks / forcedRest，
+ *        不进 freeWeeks / freeRest），因此求解器无需任何改动即可正确重解剩余部分。
  */
 export function buildProblem(rawInput, opts = {}) {
   const input = normalizeInput(rawInput, opts);
@@ -91,6 +96,8 @@ export function buildProblem(rawInput, opts = {}) {
   const t0 = input.currentDate;
   const T = opts.T || horizonEnd(t0);
   const calendar = expandCalendar(t0, T, input.annotations, input.weekForces);
+  const frozen = opts.frozen && opts.frozen.before ? opts.frozen : null;
+  if (frozen) applyFrozenPrefix(calendar, frozen);
 
   const commands = listCommands(input.club);
   const cmdById = new Map(commands.map((c) => [c.id, c]));
@@ -120,7 +127,9 @@ export function buildProblem(rawInput, opts = {}) {
       }
       const d = deltaS(cmd, wk.m); // m 个平时日当量
       for (let i = 0; i < 9; i += 1) sFix[i] += d[i];
-      forcedWeeks.push({ weekStart: wk.weekStart, m: wk.m, command: cmd.id, clubAllowed });
+      forcedWeeks.push({
+        weekStart: wk.weekStart, m: wk.m, command: cmd.id, clubAllowed, frozen: !!wk.frozen,
+      });
     } else {
       freeWeeks.push({ weekStart: wk.weekStart, m: wk.m, clubAllowed });
     }
@@ -141,7 +150,9 @@ export function buildProblem(rawInput, opts = {}) {
       }
       const d = deltaS(cmd, restWeight(cmd)); // R2：一次结算
       for (let i = 0; i < 9; i += 1) sFix[i] += d[i];
-      forcedRest.push({ date: slot.date, command: cmd.id, clubAllowed });
+      forcedRest.push({
+        date: slot.date, command: cmd.id, clubAllowed, frozen: !!slot.frozen,
+      });
     } else {
       freeRest.push({ date: slot.date, index: slot.index, clubAllowed });
     }
@@ -170,6 +181,7 @@ export function buildProblem(rawInput, opts = {}) {
     T,
     displayFrom: t0,
     displayEnd,
+    frozenBefore: frozen ? frozen.before : null,
     calendar,
     commands,
     cmdById,
@@ -198,6 +210,58 @@ export function buildProblem(rawInput, opts = {}) {
       SCALE, S_MIN, S_MAX, S_STAMINA_MIN, S_STRESS_MAX,
     },
   };
+}
+
+/**
+ * 增量重规划：把上一份排程在 `frozen.before` 之前的决策固定下来。
+ *
+ * 固定方式：直接写回 `wk.forced` / `slot.forced`（与用户强制同一条硬约束通道），
+ * 并打上 `frozen` 标记供结果面板区分展示；已在 `weekForces` / `annotations.force`
+ * 中显式声明的用户强制保持原样，不覆盖。
+ */
+function applyFrozenPrefix(calendar, frozen) {
+  const weekForces = frozen.weekForces || {};
+  const restForces = frozen.restForces || {};
+  for (const wk of calendar.weeks) {
+    const id = weekForces[wk.weekStart];
+    if (id && !wk.forced) { wk.forced = id; wk.frozen = true; }
+  }
+  for (const slot of calendar.restSlots) {
+    const id = restForces[slot.date];
+    if (id && !slot.forced) { slot.forced = id; slot.frozen = true; }
+  }
+}
+
+/**
+ * 从上一份「已求解的问题 + 排程」推导固定前缀（增量重规划的唯一推导入口）。
+ *
+ * 判定口径（与 UI 的「编辑点」一致）：
+ *  - 平时块：该块**全部**平时日都早于 before 才固定。锚点所在周允许重排 ——
+ *    改休日 / 跳过会改变该周的 m 与决策点结构，强行固定反而与用户操作冲突。
+ *  - 休日槽：日期早于 before 即固定。
+ *
+ * @param {Object} problem 上一份 buildProblem 的结果（结构须与本次一致）
+ * @param {{weekCmd:Map, restCmd:Map}} plan 上一份排程
+ * @param {string} before 编辑点日期（含当天可改）
+ * @returns {{before:string, weekForces:Object, restForces:Object}|null}
+ */
+export function frozenFromPlan(problem, plan, before) {
+  if (!problem || !plan || !before) return null;
+  const weekForces = {};
+  const restForces = {};
+  const idOf = (cmd) => (cmd && typeof cmd.id === 'string' ? cmd.id : null);
+  for (const wk of problem.weeks) {
+    if (wk.m === 0 || !wk.dates.length) continue;
+    if (wk.dates[wk.dates.length - 1] >= before) continue; // 锚点所在周允许重排
+    const id = idOf(plan.weekCmd.get(wk.weekStart));
+    if (id) weekForces[wk.weekStart] = id;
+  }
+  for (const slot of problem.restSlots) {
+    if (slot.date >= before) continue;
+    const id = idOf(plan.restCmd.get(slot.date));
+    if (id) restForces[slot.date] = id;
+  }
+  return { before, weekForces, restForces };
 }
 
 export function normalizeInput(rawInput = {}, opts = {}) {
